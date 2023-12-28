@@ -1,22 +1,30 @@
+// #![windows_subsystem = "windows"]
+#![windows_subsystem = "console"]
+
 use std::error::Error;
 use std::ffi::{c_void, CStr, CString};
 use std::num::{NonZeroIsize, NonZeroU32};
 use std::ops::Deref;
 use std::time::Instant;
+use winit::dpi::PhysicalSize;
 use winit::event_loop::EventLoopBuilder;
+use winit::platform::windows::WindowBuilderExtWindows;
+use winit::raw_window_handle as rwh_06;
 
-use raw_window_handle::{HasWindowHandle, RawWindowHandle, Win32WindowHandle};
+use raw_window_handle::HasRawWindowHandle;
 use winit::event::{ElementState, Event, MouseButton, WindowEvent};
 use winit::window::WindowBuilder;
 
+use const_cstr::const_cstr;
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextApi, ContextAttributesBuilder, Version};
 use glutin::display::GetGlDisplay;
 use glutin::prelude::*;
 use glutin::surface::SwapInterval;
-
-use const_cstr::const_cstr;
 use glutin_winit::{self, DisplayBuilder, GlWindow};
+
+use winapi::shared::windef::{HWND, RECT};
+use winapi::um::winuser::GetClientRect;
 
 pub mod gl {
     #![allow(clippy::all)]
@@ -27,27 +35,40 @@ pub mod gl {
 
 enum ScreensaverMode {
     Settings(bool),
-    Child(RawWindowHandle),
+    Child(rwh_06::Win32WindowHandle),
     Run,
 }
 fn parse_args<T>(mut iter: T) -> ScreensaverMode
 where
     T: Iterator<Item = String>,
 {
-    match (iter.next().map(|s| s.as_ref()), iter.next().as_ref()) {
+    let _ = iter.next();
+    match (dbg!(iter.next().as_deref()), dbg!(iter.next().as_deref())) {
         (None, None) => ScreensaverMode::Settings(false),
         (Some("/c"), None) => ScreensaverMode::Settings(true),
         (Some("/p"), Some(hwnd_str)) => {
-            let mut handle = Win32WindowHandle::empty();
-            handle.hwnd = hwnd_str.parse::<usize>().unwrap() as *mut _;
+            let handle = unsafe {
+                rwh_06::Win32WindowHandle::new(NonZeroIsize::new_unchecked(
+                    hwnd_str.parse::<isize>().unwrap(),
+                ))
+            };
             ScreensaverMode::Child(handle)
         }
         (Some("/s"), None) => ScreensaverMode::Run,
+        _ => unimplemented!(),
     }
 }
 fn main() -> Result<(), Box<dyn Error>> {
     let mode = parse_args(std::env::args());
-    do_main(EventLoopBuilder::new().build().unwrap())
+    use ScreensaverMode::*;
+    let event_loop = EventLoopBuilder::new().build().unwrap();
+    match mode {
+        Child(parent_window) => do_main(event_loop, Some(parent_window), false),
+        Run => {
+            unimplemented!()
+        }
+        _ => unimplemented!(),
+    }
 }
 fn gldbg(s: &str, gl: &gl::Gl) {
     unsafe {
@@ -57,17 +78,41 @@ fn gldbg(s: &str, gl: &gl::Gl) {
         }
     }
 }
-fn do_main(event_loop: winit::event_loop::EventLoop<()>) -> Result<(), Box<dyn Error>> {
+fn do_main(
+    event_loop: winit::event_loop::EventLoop<()>,
+    maybe_parent: Option<rwh_06::Win32WindowHandle>,
+    modal: bool,
+) -> Result<(), Box<dyn Error>> {
+    let maybe_client_area = maybe_parent.map(|p| {
+        let mut client_rect: RECT = Default::default();
+        unsafe {
+            GetClientRect(
+                std::mem::transmute(isize::from(p.hwnd)),
+                &mut client_rect as *mut _,
+            );
+        }
+        client_rect
+    });
     // Only Windows requires the window to be present before creating the display.
     // Other platforms don't really need one.
     //
-    let window_builder = Some(WindowBuilder::new().with_transparent(true));
+    let mut window_builder = unsafe {
+        WindowBuilder::new()
+            .with_transparent(true)
+            .with_parent_window(maybe_parent.map(rwh_06::RawWindowHandle::Win32))
+    };
+    if let Some(client_area) = maybe_client_area {
+        window_builder = window_builder.with_inner_size(PhysicalSize::new(
+            client_area.right - client_area.left,
+            client_area.bottom - client_area.top,
+        ));
+    }
 
     // The template will match only the configurations supporting rendering
     // to windows.
     let template = ConfigTemplateBuilder::new().with_alpha_size(8);
 
-    let display_builder = DisplayBuilder::new().with_window_builder(window_builder);
+    let display_builder = DisplayBuilder::new().with_window_builder(Some(window_builder));
 
     let (mut window, gl_config) = display_builder.build(&event_loop, template, |configs| {
         // Find the config with the maximum number of samples, so our triangle will
@@ -92,12 +137,11 @@ fn do_main(event_loop: winit::event_loop::EventLoop<()>) -> Result<(), Box<dyn E
         .as_ref()
         .map(|window| {
             let sz = window.inner_size();
+            window.set_decorations(false);
             (sz.width, sz.height)
         })
         .unwrap_or((0, 0)));
-    let window_handle = window
-        .as_ref()
-        .map(|window| window.window_handle().unwrap().as_raw());
+    let window_handle = window.as_ref().map(|window| window.raw_window_handle());
 
     // XXX The display could be obtained from any object created by it, so we can
     // query it from the config.
@@ -557,7 +601,7 @@ static VERTEX_DATA: [f32; 12] = [
      1.0,  1.0, // TOP RIGHT
     -1.0,  1.0, // TOP LEFT
     -1.0, -1.0, // BOTTOM LEFT
-    
+
      1.0,  1.0, // TOP RIGHT
     -1.0, -1.0, // BOTTOM LEFT
      1.0, -1.0, // BOTTOM RIGHT
@@ -613,33 +657,33 @@ const TEST_FRAG_SHADER: &str = "
 
 float distanceToSegment( vec2 a, vec2 b, vec2 p )
 {
-	vec2 pa = p - a, ba = b - a;
-	float h = clamp( dot(pa,ba)/dot(ba,ba), 0.0, 1.0 );
-	return length( pa - ba*h );
+        vec2 pa = p - a, ba = b - a;
+        float h = clamp( dot(pa,ba)/dot(ba,ba), 0.0, 1.0 );
+        return length( pa - ba*h );
 }
 
 void mainImage( out vec4 fragColor, in vec2 fragCoord )
 {
-	vec2 p = fragCoord / iResolution.x;
+        vec2 p = fragCoord / iResolution.x;
     vec2 cen = 0.5*iResolution.xy/iResolution.x;
     vec4 m = iMouse / iResolution.x;
-	
-	vec3 col = vec3(0.0);
 
-	if( m.z>0.0 ) // button is down
-	{
-		float d = distanceToSegment( m.xy, abs(m.zw), p );
+        vec3 col = vec3(0.0);
+
+        if( m.z>0.0 ) // button is down
+        {
+                float d = distanceToSegment( m.xy, abs(m.zw), p );
         col = mix( col, vec3(1.0,1.0,0.0), 1.0-smoothstep(.004,0.008, d) );
-	}
-	if( m.w>0.0 ) // button click
-	{
+        }
+        if( m.w>0.0 ) // button click
+        {
         col = mix( col, vec3(1.0,1.0,1.0), 1.0-smoothstep(0.1,0.105, length(p-cen)) );
     }
 
-	col = mix( col, vec3(1.0,0.0,0.0), 1.0-smoothstep(0.03,0.035, length(p-    m.xy )) );
+        col = mix( col, vec3(1.0,0.0,0.0), 1.0-smoothstep(0.03,0.035, length(p-    m.xy )) );
     col = mix( col, vec3(0.0,0.0,1.0), 1.0-smoothstep(0.03,0.035, length(p-abs(m.zw))) );
 
-	fragColor = vec4( col, 1.0 );
+        fragColor = vec4( col, 1.0 );
 }
 ";
 // Fragment shader suffix.
