@@ -1,11 +1,12 @@
-// #![windows_subsystem = "windows"]
-#![windows_subsystem = "console"]
+#![windows_subsystem = "windows"]
+// #![windows_subsystem = "console"]
 
+use gl::types::GLint;
 use std::error::Error;
 use std::ffi::{c_void, CStr, CString};
 use std::num::{NonZeroIsize, NonZeroU32};
 use std::ops::Deref;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use winit::dpi::PhysicalSize;
 use winit::event_loop::EventLoopBuilder;
 use winit::platform::windows::WindowBuilderExtWindows;
@@ -13,7 +14,7 @@ use winit::raw_window_handle as rwh_06;
 
 use raw_window_handle::HasRawWindowHandle;
 use winit::event::{ElementState, Event, MouseButton, WindowEvent};
-use winit::window::WindowBuilder;
+use winit::window::{Fullscreen, WindowBuilder};
 
 use const_cstr::const_cstr;
 use glutin::config::ConfigTemplateBuilder;
@@ -33,6 +34,8 @@ pub mod gl {
     pub use Gles2 as Gl;
 }
 
+mod shaders;
+
 enum ScreensaverMode {
     Settings(bool),
     Child(rwh_06::Win32WindowHandle),
@@ -43,7 +46,7 @@ where
     T: Iterator<Item = String>,
 {
     let _ = iter.next();
-    match (dbg!(iter.next().as_deref()), dbg!(iter.next().as_deref())) {
+    match (iter.next().as_deref(), iter.next().as_deref()) {
         (None, None) => ScreensaverMode::Settings(false),
         (Some("/c"), None) => ScreensaverMode::Settings(true),
         (Some("/p"), Some(hwnd_str)) => {
@@ -58,15 +61,32 @@ where
         _ => unimplemented!(),
     }
 }
+fn create_fullscreen_mode(
+    event_loop: &winit::event_loop::EventLoop<()>,
+) -> Result<Fullscreen, Box<dyn Error>> {
+    // for m in event_loop.available_monitors() {
+    //     println!("{:?}", m.name());
+    //     for v in m.video_modes() {
+    //         println!("{:?} {}", v.size(), v.bit_depth());
+    //     }
+    // }
+
+    // let monitor = event_loop
+    //     .available_monitors()
+    //     .next()
+    //     .ok_or("no monitors".to_string())?;
+
+    // let mode = monitor.video_modes().next().ok_or("no_modes".to_string())?;
+    Ok(Fullscreen::Borderless(None))
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mode = parse_args(std::env::args());
     use ScreensaverMode::*;
     let event_loop = EventLoopBuilder::new().build().unwrap();
     match mode {
         Child(parent_window) => do_main(event_loop, Some(parent_window), false),
-        Run => {
-            unimplemented!()
-        }
+        Run => do_main(event_loop, None, true),
         _ => unimplemented!(),
     }
 }
@@ -78,10 +98,14 @@ fn gldbg(s: &str, gl: &gl::Gl) {
         }
     }
 }
+fn after_delay(start_time: Instant) -> bool {
+    Instant::now() - start_time > Duration::from_secs(1)
+}
+
 fn do_main(
     event_loop: winit::event_loop::EventLoop<()>,
     maybe_parent: Option<rwh_06::Win32WindowHandle>,
-    modal: bool,
+    fullscreen: bool,
 ) -> Result<(), Box<dyn Error>> {
     let maybe_client_area = maybe_parent.map(|p| {
         let mut client_rect: RECT = Default::default();
@@ -93,6 +117,11 @@ fn do_main(
         }
         client_rect
     });
+    let fullscreen_mode = if fullscreen {
+        Some(create_fullscreen_mode(&event_loop)?)
+    } else {
+        None
+    };
     // Only Windows requires the window to be present before creating the display.
     // Other platforms don't really need one.
     //
@@ -100,6 +129,7 @@ fn do_main(
         WindowBuilder::new()
             .with_transparent(true)
             .with_parent_window(maybe_parent.map(rwh_06::RawWindowHandle::Win32))
+            .with_fullscreen(fullscreen_mode)
     };
     if let Some(client_area) = maybe_client_area {
         window_builder = window_builder.with_inner_size(PhysicalSize::new(
@@ -185,6 +215,7 @@ fn do_main(
     let mut last_clicked_coords = None;
     let (mut mx, mut my) = (0.0, 0.0);
     let (mut is_down, mut is_clicked) = (false, false);
+    let start_time = Instant::now();
 
     event_loop.run(move |event, window_target| {
         match event {
@@ -205,12 +236,22 @@ fn do_main(
                         .create_window_surface(&gl_config, &attrs)
                         .unwrap()
                 };
-                let (width, height) = (gl_surface.width().unwrap(), gl_surface.height().unwrap());
+                // let (width, height) = (gl_surface.width().unwrap(), gl_surface.height().unwrap());
                 // Make it current.
+
                 let gl_context = not_current_gl_context
                     .take()
-                    .unwrap()
-                    .make_current(&gl_surface)
+                    .map(|not_current_gl_context| {
+                        let gl_context = not_current_gl_context.treat_as_possibly_current();
+                        gl_surface.resize(
+                            &gl_context,
+                            NonZeroU32::new(width).unwrap(),
+                            NonZeroU32::new(height).unwrap(),
+                        );
+
+                        gl_context.make_current(&gl_surface).unwrap();
+                        gl_context
+                    })
                     .unwrap();
 
                 // The context needs to be current for the Renderer to set up shaders and
@@ -219,13 +260,15 @@ fn do_main(
                 renderer.get_or_insert_with(|| {
                     Renderer::new(
                         &gl_display,
-                        DEFAULT_VERT_SRC_STR,
-                        // &(PREFIX.to_string() + TEST_FRAG_SHADER + SUFFIX),
-                        &(PREFIX.to_string() + DEFAULT_FRAG_SRC_STR + SUFFIX),
+                        shaders::DEFAULT_VERT_SHADER,
+                        &(shaders::PREFIX.to_string()
+                            + shaders::DEFAULT_FRAG_SHADER
+                            + shaders::SUFFIX),
                         dbg!(width as f32),
                         dbg!(height as f32),
                     )
                 });
+                renderer.as_mut().map(|r| r.resize(width, height));
 
                 // Try setting vsync.
                 if let Err(res) = gl_surface
@@ -248,62 +291,64 @@ fn do_main(
                     .replace(gl_context.make_not_current().unwrap())
                     .is_none());
             }
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::Resized(size) => {
-                    if size.width != 0 && size.height != 0 {
-                        // Some platforms like EGL require resizing GL surface to update the size
-                        // Notable platforms here are Wayland and macOS, other don't require it
-                        // and the function is no-op, but it's wise to resize it for portability
-                        // reasons.
-                        if let Some((gl_context, gl_surface, _)) = &state {
-                            gl_surface.resize(
-                                gl_context,
-                                NonZeroU32::new(size.width).unwrap(),
-                                NonZeroU32::new(size.height).unwrap(),
-                            );
-                            let renderer = renderer.as_mut().unwrap();
-                            renderer.resize(size.width, size.height);
+            Event::WindowEvent { event, .. } => {
+                match event {
+                    WindowEvent::Resized(size) => {
+                        if size.width != 0 && size.height != 0 {
+                            // Some platforms like EGL require resizing GL surface to update the size
+                            // Notable platforms here are Wayland and macOS, other don't require it
+                            // and the function is no-op, but it's wise to resize it for portability
+                            // reasons.
+                            if let Some((gl_context, gl_surface, _)) = &state {
+                                gl_surface.resize(
+                                    gl_context,
+                                    NonZeroU32::new(size.width).unwrap(),
+                                    NonZeroU32::new(size.height).unwrap(),
+                                );
+                                let renderer = renderer.as_mut().unwrap();
+                                renderer.resize(size.width, size.height);
+                            }
                         }
                     }
-                }
-                WindowEvent::CursorMoved { position, .. } => {
-                    mx = position.x as f32;
-                    my = height as f32 - position.y as f32;
-                    // Flip y-axis.
-                    if is_down {
-                        last_down_coords = Some((mx, my))
-                    }
-                }
-                WindowEvent::MouseInput { state, button, .. } => {
-                    if button == MouseButton::Left {
-                        if dbg!(state) == ElementState::Pressed {
-                            last_down_coords = Some((mx, my));
-                            last_clicked_coords = Some((mx, my));
-                            is_clicked = true;
-                            is_down = true;
+                    WindowEvent::CursorMoved { position, .. } => {
+                        if fullscreen && after_delay(start_time) {
+                            window_target.exit();
                         } else {
-                            is_down = false;
+                            mx = position.x as f32;
+                            my = height as f32 - position.y as f32;
+                            // Flip y-axis.
+                            if is_down {
+                                last_down_coords = Some((mx, my))
+                            }
                         }
                     }
-                }
+                    WindowEvent::MouseInput { state, button, .. } => {
+                        if fullscreen && after_delay(start_time) {
+                            window_target.exit();
+                        } else {
+                            if button == MouseButton::Left {
+                                if state == ElementState::Pressed {
+                                    last_down_coords = Some((mx, my));
+                                    last_clicked_coords = Some((mx, my));
+                                    is_clicked = true;
+                                    is_down = true;
+                                } else {
+                                    is_down = false;
+                                }
+                            }
+                        }
+                    }
 
-                WindowEvent::CloseRequested => window_target.exit(),
-                _ => (),
-            },
+                    WindowEvent::CloseRequested => window_target.exit(),
+                    _ => (),
+                }
+            }
+
             Event::AboutToWait => {
                 if let Some((gl_context, gl_surface, window)) = &state {
                     let renderer = renderer.as_mut().unwrap();
                     renderer.incr_frame();
-                    if is_down || is_clicked || last_down_coords.is_some() {
-                        renderer.draw(
-                            dbg!(last_down_coords),
-                            dbg!(last_clicked_coords),
-                            dbg!(is_down),
-                            dbg!(is_clicked),
-                        );
-                    } else {
-                        renderer.draw(last_down_coords, last_clicked_coords, is_down, is_clicked);
-                    }
+                    renderer.draw(last_down_coords, last_clicked_coords, is_down, is_clicked);
                     window.request_redraw();
 
                     gl_surface.swap_buffers(gl_context).unwrap();
@@ -507,7 +552,7 @@ impl Renderer {
                 UNIFORM_IRESOLUTION.as_ptr(),
                 self.width,
                 self.height,
-                self.width / self.height,
+                1.0, //self.width / self.height,
             );
             set_uniform4f(
                 &self.gl,
@@ -566,11 +611,12 @@ unsafe fn create_shader(
     source: &[u8],
 ) -> gl::types::GLuint {
     let shader = gl.CreateShader(shader_type);
+    let shader_len: GLint = source.len() as GLint;
     gl.ShaderSource(
         shader,
         1,
         [source.as_ptr().cast()].as_ptr(),
-        std::ptr::null(),
+        (&shader_len) as *const _,
     );
     gl.CompileShader(shader);
     gldbg("CompileShader", &gl);
@@ -607,30 +653,6 @@ static VERTEX_DATA: [f32; 12] = [
      1.0, -1.0, // BOTTOM RIGHT
 ];
 
-// Default shaders.
-pub static DEFAULT_VERT_SRC_STR: &str = include_str!("../shaders/default.vert");
-pub static DEFAULT_FRAG_SRC_STR: &str = include_str!("../shaders/default.frag");
-
-// Fragment shader prefix.
-const PREFIX: &str = "
-    #version 150 core
-
-    uniform float     iGlobalTime;
-    uniform float     iTime;
-    uniform vec3      iResolution;
-    uniform vec4      iMouse;
-    uniform int       iFrame;
-    uniform sampler2D iChannel0;
-    uniform sampler2D iChannel1;
-    uniform sampler2D iChannel2;
-    uniform sampler2D iChannel3;
-
-    in vec2 fragCoord;
-    out vec4 fragColor;
-
-
-";
-
 const_cstr! {
     UNIFORM_IGLOBALTIME = "iGlobalTime";
     UNIFORM_ITIME = "iTime";
@@ -642,54 +664,3 @@ const_cstr! {
     UNIFORM_ICHANNEL2 = "iChannel2";
     UNIFORM_ICHANNEL3 = "iChannel3";
 }
-
-const TEST_FRAG_SHADER: &str = "
-// Created by inigo quilez - iq/2013
-// https://www.youtube.com/c/InigoQuilez
-// https://iquilezles.org/
-
-// Shows how to use the mouse input (only left button supported):
-//
-//      mouse.xy  = mouse position during last button down
-//  abs(mouse.zw) = mouse position during last button click
-// sign(mouze.z)  = button is down
-// sign(mouze.w)  = button is clicked
-
-float distanceToSegment( vec2 a, vec2 b, vec2 p )
-{
-        vec2 pa = p - a, ba = b - a;
-        float h = clamp( dot(pa,ba)/dot(ba,ba), 0.0, 1.0 );
-        return length( pa - ba*h );
-}
-
-void mainImage( out vec4 fragColor, in vec2 fragCoord )
-{
-        vec2 p = fragCoord / iResolution.x;
-    vec2 cen = 0.5*iResolution.xy/iResolution.x;
-    vec4 m = iMouse / iResolution.x;
-
-        vec3 col = vec3(0.0);
-
-        if( m.z>0.0 ) // button is down
-        {
-                float d = distanceToSegment( m.xy, abs(m.zw), p );
-        col = mix( col, vec3(1.0,1.0,0.0), 1.0-smoothstep(.004,0.008, d) );
-        }
-        if( m.w>0.0 ) // button click
-        {
-        col = mix( col, vec3(1.0,1.0,1.0), 1.0-smoothstep(0.1,0.105, length(p-cen)) );
-    }
-
-        col = mix( col, vec3(1.0,0.0,0.0), 1.0-smoothstep(0.03,0.035, length(p-    m.xy )) );
-    col = mix( col, vec3(0.0,0.0,1.0), 1.0-smoothstep(0.03,0.035, length(p-abs(m.zw))) );
-
-        fragColor = vec4( col, 1.0 );
-}
-";
-// Fragment shader suffix.
-const SUFFIX: &str = "
-
-    void main() {
-            mainImage(fragColor, fragCoord);
-    }
-";

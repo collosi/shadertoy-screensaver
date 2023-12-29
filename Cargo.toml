@@ -1,5 +1,5 @@
 [package]
-name = "winitglutigfx"
+name = "shadertoy-screensaver"
 version = "0.1.0"
 edition = "2021"
 
@@ -16,3 +16,7 @@ winapi = { version = "0.3.9", features = ["winuser", "impl-default"] }
 [build-dependencies]
 gl_generator = "0.14"
 cfg_aliases = "0.1.1"
+
+[[bin]]
+name = "shadertoy"
+path = "src/main.rs"
